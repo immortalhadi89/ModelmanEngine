@@ -1,0 +1,290 @@
+name: '🔍 Search'
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'URL to fetch'
+        required: true
+        default: 'https://example.com'
+      download_images:
+        description: 'Download images from the page?'
+        required: false
+        default: true
+        type: boolean
+      image_formats:
+        description: 'Image formats to download (comma‑separated, e.g. jpg,jpeg,png,gif)'
+        required: false
+        default: 'jpg,jpeg,png,gif'
+      start_index:
+        description: 'Start index of images (1 = first image)'
+        required: false
+        default: 1
+        type: number
+      end_index:
+        description: 'End index of images'
+        required: false
+        default: 20
+        type: number
+      expand_sections:
+        description: 'Expand all sections by default (otherwise they are collapsed)'
+        required: false
+        default: true
+        type: boolean
+      use_vpn:
+        description: 'Use VPN (WARP) to bypass restrictions (may not work perfectly against bot detection)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Start WARP VPN (if enabled)
+        if: github.event.inputs.use_vpn == 'true'
+        run: |
+          docker network create warp-net || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+          echo "Waiting for WARP to initialize..."
+          sleep 15
+          curl -s --max-time 5 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace | grep warp || echo "WARP may not be active yet, continuing"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright requests beautifulsoup4
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Fetch, extract text, links, and download images (if requested)
+        run: |
+          python3 << 'EOF'
+          from playwright.sync_api import sync_playwright
+          from urllib.parse import urljoin, urlparse
+          import os, shutil, requests, re
+          from pathlib import Path
+
+          target_url = "${{ github.event.inputs.url }}"
+          use_vpn = "${{ github.event.inputs.use_vpn }}" == "true"
+          expand = "${{ github.event.inputs.expand_sections }}" == "true"
+          download_images = "${{ github.event.inputs.download_images }}" == "true"
+          start_idx = int("${{ github.event.inputs.start_index }}")
+          end_idx = int("${{ github.event.inputs.end_index }}")
+          raw_formats = "${{ github.event.inputs.image_formats }}"
+          image_formats = [fmt.strip().lower() for fmt in raw_formats.split(',')]
+          output_filename = "README.md"
+          images_dir = "images"
+
+          print(f"URL: {target_url}")
+          print(f"VPN enabled: {use_vpn}")
+          print(f"Expand sections: {expand}")
+          print(f"Download images: {download_images}")
+          if download_images:
+              print(f"Image range: {start_idx} to {end_idx}")
+              print(f"Image formats: {image_formats}")
+
+          proxy = None
+          if use_vpn:
+              proxy = {"server": "socks5://127.0.0.1:1080"}
+
+          if download_images and os.path.exists(images_dir):
+              shutil.rmtree(images_dir)
+          if download_images:
+              os.makedirs(images_dir)
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, proxy=proxy,
+                  args=['--disable-blink-features=AutomationControlled'])
+              page = browser.new_page()
+              print("Loading page...")
+              page.goto(target_url, timeout=30000, wait_until="networkidle")
+
+              visible_text = page.evaluate("""
+                  () => {
+                      const body = document.body.cloneNode(true);
+                      body.querySelectorAll('script, style, meta, link').forEach(el => el.remove());
+                      return body.innerText || '';
+                  }
+              """)
+              print(f"Visible text length: {len(visible_text)}")
+
+              all_links = page.evaluate(f"""
+                  () => {{
+                      const base = '{target_url}';
+                      const links = new Set();
+                      for (const a of document.querySelectorAll('a[href]')) {{
+                          let href = a.getAttribute('href');
+                          if (!href || href.startsWith('javascript:') || href === '#') continue;
+                          try {{
+                              const absolute = new URL(href, base).href;
+                              if (absolute.startsWith('http:') || absolute.startsWith('https:'))
+                                  links.add(absolute);
+                          }} catch(e) {{}}
+                      }}
+                      return Array.from(links);
+                  }}
+              """)
+
+              def matches_format(url):
+                  lower_url = url.lower()
+                  for fmt in image_formats:
+                      if lower_url.endswith(f'.{fmt}'):
+                          return True
+                  return False
+
+              image_urls = set()
+              img_srcs = page.evaluate("""
+                  () => Array.from(document.querySelectorAll('img[src]')).map(img => img.src)
+              """)
+              for src in img_srcs:
+                  if src and src.startswith(('http://', 'https://')) and matches_format(src):
+                      image_urls.add(src)
+
+              for link in all_links:
+                  if matches_format(link):
+                      image_urls.add(link)
+
+              bg_images = page.evaluate("""
+                  () => {
+                      const urls = [];
+                      for (const el of document.querySelectorAll('[style*="background"]')) {
+                          const style = getComputedStyle(el);
+                          const bg = style.backgroundImage;
+                          if (bg && bg !== 'none') {
+                              const match = bg.match(/url\\(["']?([^"')]+)["']?\\)/);
+                              if (match) urls.push(match[1]);
+                          }
+                      }
+                      return urls;
+                  }
+              """)
+              for bg in bg_images:
+                  if bg and matches_format(bg) and bg.startswith(('http://', 'https://')):
+                      image_urls.add(bg)
+
+              sorted_images = sorted(image_urls, key=lambda s: s.lower())
+              print(f"Total unique image URLs found: {len(sorted_images)}")
+
+              downloaded_images = []
+
+              if download_images and sorted_images:
+                  start = max(0, start_idx - 1)
+                  end = min(len(sorted_images), end_idx)
+                  selected = sorted_images[start:end]
+                  print(f"Downloading images {start_idx} to {min(end_idx, len(sorted_images))}")
+
+                  session = requests.Session()
+                  if proxy:
+                      session.proxies = {'http': proxy['server'], 'https': proxy['server']}
+                  session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+
+                  for i, img_url in enumerate(selected, start=start_idx):
+                      try:
+                          parsed = urlparse(img_url)
+                          filename = os.path.basename(parsed.path)
+                          if not filename or '.' not in filename:
+                              ext = '.jpg'
+                              if '.png' in img_url.lower():
+                                  ext = '.png'
+                              elif '.gif' in img_url.lower():
+                                  ext = '.gif'
+                              filename = f"image_{i}{ext}"
+                          else:
+                              filename = re.sub(r'[\\/*?:"<>|]', '_', filename)
+
+                          filepath = os.path.join(images_dir, filename)
+                          if os.path.exists(filepath):
+                              name, ext = os.path.splitext(filename)
+                              filename = f"{name}_{i}{ext}"
+                              filepath = os.path.join(images_dir, filename)
+
+                          print(f"Downloading [{i}] {img_url[:80]}...")
+                          resp = session.get(img_url, timeout=20, stream=True)
+                          resp.raise_for_status()
+                          with open(filepath, 'wb') as f:
+                              for chunk in resp.iter_content(1024):
+                                  f.write(chunk)
+                          print(f"  Saved as {filename}")
+                          downloaded_images.append(filename)
+                      except Exception as e:
+                          print(f"  Failed to download {img_url}: {e}")
+
+              browser.close()
+
+          details_open = " open" if expand else ""
+          expand_summary = "Click to collapse" if expand else "Click to expand"
+
+          with open(output_filename, 'w', encoding='utf-8') as f:
+              f.write(f"# Extracted Content from [{target_url}]({target_url})\n\n")
+
+              # ----- NEW PROFESSIONAL GREY BLOCK WITH EMOJIS -----
+              f.write("> 🚀 **ModelmanEngine** helps Iranians search the internet freely, even with restrictions and after the 2026 war.\n")
+              f.write(">\n")
+              f.write("> 🛠️ **How to use:**  \n")
+              f.write("> - 💻 **Windows & Android (desktop mode on):** Go to **Actions** → **All workflows ▽** → **🔍 Search** → **Run workflow ▽** → pick settings → click green **Run workflow**.  \n")
+              f.write("> - 📱 **Android (desktop mode off):** Tap **More ▽** → **Actions** → **All workflows ▽** → **🔍 Search** → **Run workflow ▽** → pick settings → tap green **Run workflow**.  \n")
+              f.write("> - ♻️ **Factory reset:** Run **♻️ Reset Factory** workflow → deletes everything → back to day one.\n")
+              f.write(">\n")
+              f.write("> 👤 *Created by **Hossein Alinaghipoor aka Modelman** – [YouTube Channel](http://www.youtube.com/@modelmananimation)*\n\n")
+              # --------------------------------------------------
+
+              # Table of Contents
+              f.write("## 📑 Jump to Section\n\n")
+              f.write("- [🖼️ Images & GIFs](#️-images--gifs)\n")
+              f.write("- [📄 Full Page Text Content](#-full-page-text-content)\n")
+              f.write("- [🔗 All Extracted Links](#-all-extracted-links)\n\n")
+
+              # Section 1: Images
+              if download_images and downloaded_images:
+                  f.write("## 🖼️ Images & GIFs\n\n")
+                  for img_file in downloaded_images:
+                      f.write(f"![{img_file}]({images_dir}/{img_file})\n\n")
+              elif download_images and not downloaded_images:
+                  f.write("## 🖼️ Images & GIFs\n\n*No images found or downloaded.*\n\n")
+
+              # Section 2: Full Text
+              f.write("## 📄 Full Page Text Content\n\n")
+              f.write(f"<details{details_open}>\n<summary>{expand_summary} (full page text)</summary>\n\n")
+              f.write("```\n")
+              f.write(visible_text.strip())
+              f.write("\n```\n\n")
+              f.write("</details>\n\n")
+
+              # Section 3: Links
+              f.write("## 🔗 All Extracted Links\n\n")
+              f.write(f"<details{details_open}>\n<summary>{expand_summary} (list of links)</summary>\n\n")
+              for link in sorted(all_links):
+                  f.write(f"- <{link}>\n")
+              f.write("\n</details>\n")
+
+          print(f"Successfully wrote {output_filename}.")
+          if download_images:
+              print(f"Images downloaded to '{images_dir}/' folder and linked in README.")
+          EOF
+
+      - name: Commit changes to repo
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add README.md
+          if [ "${{ github.event.inputs.download_images }}" == "true" ]; then
+            git add images/
+          fi
+          git diff --cached --quiet || git commit -m "Extract content and images for ${{ github.event.inputs.url }} [skip ci]"
+          git push
+
+      - name: Stop WARP container (if started)
+        if: always() && github.event.inputs.use_vpn == 'true'
+        run: docker stop warp || true
