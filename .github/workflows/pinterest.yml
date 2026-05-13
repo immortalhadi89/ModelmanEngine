@@ -13,7 +13,7 @@ on:
         default: true
         type: boolean
       download_images:
-        description: 'Download images from the page?'
+        description: 'Download images from the page (thumbnails)?'
         required: false
         default: true
         type: boolean
@@ -87,16 +87,17 @@ jobs:
           pip install playwright requests beautifulsoup4
           playwright install chromium
 
-      - name: Fetch Pinterest search, extract text, links, download images, and conditionally save PDF
+      - name: Fetch Pinterest search, extract text, links, download thumbnails, and download HQ pin images
         run: |
           python3 << 'EOF'
           from playwright.sync_api import sync_playwright, Error as PlaywrightError
           from urllib.parse import urlparse, quote
-          import os, shutil, requests, re, time
+          import os, shutil, requests, re, time, json
           from datetime import datetime
+          from bs4 import BeautifulSoup
 
+          # ------------------------- CONFIGURATION ----------------------------------
           raw_query = "${{ github.event.inputs.search_query }}"
-          # Build Pinterest search URL: spaces become %20 (quote uses %20 by default)
           encoded_query = quote(raw_query, safe='')
           target_url = f"https://www.pinterest.com/search/pins/?q={encoded_query}"
           print(f"Constructed Pinterest URL: {target_url}")
@@ -104,7 +105,7 @@ jobs:
           store_history = "${{ github.event.inputs.store_history }}" == "true"
           use_vpn = "${{ github.event.inputs.use_vpn }}" == "true"
           expand = "${{ github.event.inputs.expand_sections }}" == "true"
-          download_images = "${{ github.event.inputs.download_images }}" == "true"
+          download_thumbnails = "${{ github.event.inputs.download_images }}" == "true"
           save_pdf = "${{ github.event.inputs.save_pdf }}" == "true"
           start_idx = int("${{ github.event.inputs.start_index }}")
           end_idx = int("${{ github.event.inputs.end_index }}")
@@ -115,16 +116,17 @@ jobs:
           output_filename = "README.md"
           images_dir = "images"
           pdf_dir = "pdf"
+          # -------------------------------------------------------------------------
 
           print(f"Search query: {raw_query}")
           print(f"Store history: {store_history}")
           print(f"VPN enabled: {use_vpn}")
           print(f"Expand sections: {expand}")
-          print(f"Download images: {download_images}")
+          print(f"Download thumbnails: {download_thumbnails}")
           print(f"Save PDF: {save_pdf}")
-          if download_images:
-              print(f"Image range: {start_idx} to {end_idx}")
-              print(f"Image formats: {image_formats}")
+          if download_thumbnails:
+              print(f"Thumbnail range: {start_idx} to {end_idx}")
+              print(f"Thumbnail formats: {image_formats}")
           print(f"Clean text: {clean_text_flag}")
           print(f"Timeout: {timeout_ms/1000} seconds")
 
@@ -143,7 +145,7 @@ jobs:
           os.makedirs(pdf_dir)
           print(f"Recreated empty {pdf_dir}/ folder")
 
-          # Helper: expand short URLs
+          # Helper functions
           def expand_short_url(url):
               try:
                   session = requests.Session()
@@ -171,8 +173,59 @@ jobs:
               timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
               return f"{folder_base}_{timestamp}"
 
+          # -------- High‑Quality Pinterest Image Functions (the “Direct” method) ----------
+          def get_highres_pin_image_url(pin_url):
+              """Return direct high-res image URL from a pin URL."""
+              headers = {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                  'Accept-Language': 'en-US,en;q=0.9',
+                  'Referer': 'https://www.pinterest.com/'
+              }
+              s = requests.Session()
+              resp = s.get(pin_url, headers=headers, timeout=15)
+              resp.raise_for_status()
+              soup = BeautifulSoup(resp.text, 'html.parser')
+
+              # Method 1: og:image
+              meta = soup.find('meta', property='og:image')
+              if meta and meta.get('content'):
+                  img_url = meta['content']
+                  # Upgrade to originals if it's a thumbnail size
+                  for size in ['236x', '564x', '736x']:
+                      if size in img_url:
+                          return img_url.replace(size, 'originals')
+                  return img_url
+
+              # Method 2: JSON-LD
+              for script in soup.find_all('script', type='application/ld+json'):
+                  try:
+                      data = json.loads(script.string)
+                      if 'image' in data:
+                          return data['image']
+                  except:
+                      pass
+
+              # Method 3: search for originals in page source
+              match = re.search(r'https://i\.pinimg\.com/originals/[^"\']+', resp.text)
+              if match:
+                  return match.group(0)
+
+              return None
+
+          def download_highres_image(img_url, save_path):
+              os.makedirs(os.path.dirname(save_path), exist_ok=True)
+              headers = {'Referer': 'https://www.pinterest.com/', 'User-Agent': 'Mozilla/5.0'}
+              r = requests.get(img_url, headers=headers, stream=True, timeout=30)
+              r.raise_for_status()
+              with open(save_path, 'wb') as f:
+                  for chunk in r.iter_content(8192):
+                      f.write(chunk)
+              return True
+          # -------------------------------------------------------------------------------
+
           page_load_success = False
-          downloaded_images = []
+          downloaded_thumbnails = []
+          high_quality_images = []   # list of (pin_url, local_filename)
 
           with sync_playwright() as p:
               browser = None
@@ -205,7 +258,7 @@ jobs:
               if not page_load_success and page is None:
                   raise Exception("Could not load page after 3 attempts")
 
-              # Extract visible text
+              # ----- Extract visible text (for README) -----
               raw_text = page.evaluate("""
                   () => {
                       const body = document.body.cloneNode(true);
@@ -216,7 +269,7 @@ jobs:
               visible_text = clean_text(raw_text)
               print(f"Visible text length (raw: {len(raw_text)}, cleaned: {len(visible_text)})")
 
-              # Extract all links
+              # ----- Extract all links (for README) -----
               all_links_raw = page.evaluate(f"""
                   () => {{
                       const base = '{target_url}';
@@ -246,7 +299,51 @@ jobs:
                       link_display_items.append((link, link))
               print(f"Total unique links after expansion: {len(link_display_items)}")
 
-              # Image extraction
+              # ----- Extract pin URLs from the page (for high-quality images) -----
+              pin_urls = set()
+              pin_links = page.evaluate("""
+                  () => {
+                      const links = new Set();
+                      for (const a of document.querySelectorAll('a[href]')) {
+                          let href = a.getAttribute('href');
+                          if (!href) continue;
+                          // Match relative or absolute pin URLs
+                          if (href.match(/^\\/pin\\/\\d+\\/$/) || href.match(/^https:\\/\\/www\\.pinterest\\.com\\/pin\\/\\d+\\/$/)) {
+                              let full = href.startsWith('/') ? 'https://www.pinterest.com' + href : href;
+                              links.add(full);
+                          }
+                      }
+                      return Array.from(links);
+                  }
+              """)
+              for p in pin_links:
+                  pin_urls.add(p)
+              print(f"Found {len(pin_urls)} unique pin URLs for high-quality extraction")
+
+              # ----- Download high-quality images from each pin -----
+              hq_dir = os.path.join(images_dir, "high_quality")
+              os.makedirs(hq_dir, exist_ok=True)
+
+              for idx, pin_url in enumerate(pin_urls, 1):
+                  pin_id = pin_url.strip('/').split('/')[-1]
+                  print(f"[{idx}/{len(pin_urls)}] Processing pin {pin_id}: {pin_url}")
+                  img_url = get_highres_pin_image_url(pin_url)
+                  if not img_url:
+                      print(f"  Could not find high-res image for pin {pin_id}")
+                      continue
+                  ext = img_url.split('.')[-1].split('?')[0].lower()
+                  if ext not in ['jpg', 'jpeg', 'png', 'webp']:
+                      ext = 'jpg'
+                  filename = f"{pin_id}.{ext}"
+                  save_path = os.path.join(hq_dir, filename)
+                  try:
+                      download_highres_image(img_url, save_path)
+                      print(f"  Downloaded high-res image -> {save_path}")
+                      high_quality_images.append((pin_url, filename))
+                  except Exception as e:
+                      print(f"  Failed to download {img_url}: {e}")
+
+              # ----- Extract image URLs for thumbnails (existing behaviour) -----
               def matches_format(url):
                   lower_url = url.lower()
                   for fmt in image_formats:
@@ -286,13 +383,14 @@ jobs:
                       image_urls.add(bg)
 
               sorted_images = sorted(image_urls, key=lambda s: s.lower())
-              print(f"Total unique image URLs found: {len(sorted_images)}")
+              print(f"Total unique thumbnail URLs found: {len(sorted_images)}")
 
-              if download_images and sorted_images:
+              # ----- Download thumbnails (if enabled) -----
+              if download_thumbnails and sorted_images:
                   start = max(0, start_idx - 1)
                   end = min(len(sorted_images), end_idx)
                   selected = sorted_images[start:end]
-                  print(f"Downloading images {start_idx} to {min(end_idx, len(sorted_images))}")
+                  print(f"Downloading thumbnails {start_idx} to {min(end_idx, len(sorted_images))}")
 
                   session = requests.Session()
                   if proxy:
@@ -319,17 +417,18 @@ jobs:
                               filename = f"{name}_{i}{ext}"
                               filepath = os.path.join(images_dir, filename)
 
-                          print(f"Downloading [{i}] {img_url[:80]}...")
+                          print(f"Downloading thumbnail [{i}] {img_url[:80]}...")
                           resp = session.get(img_url, timeout=20, stream=True)
                           resp.raise_for_status()
                           with open(filepath, 'wb') as f:
                               for chunk in resp.iter_content(1024):
                                   f.write(chunk)
                           print(f"  Saved as {filename}")
-                          downloaded_images.append(filename)
+                          downloaded_thumbnails.append(filename)
                       except Exception as e:
                           print(f"  Failed to download {img_url}: {e}")
 
+              # ----- Save PDF if requested -----
               if save_pdf:
                   try:
                       timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -346,6 +445,7 @@ jobs:
 
               browser.close()
 
+          # ------------------------- WRITE README.md ------------------------------------
           details_open = " open" if expand else ""
           expand_summary = "Click to collapse" if expand else "Click to expand"
 
@@ -354,17 +454,30 @@ jobs:
               f.write("> 👤 *Created by **Hossein Alinaghipoor aka Modelman** – [YouTube Channel](http://www.youtube.com/@modelmananimation)*\n\n")
               f.write(f"**Search query:** `{raw_query}`\n")
               f.write(f"**Pinterest URL:** `{target_url}`\n\n")
-              f.write("**Jump to:** [🖼️ Images](#-images) · [📄 Text](#-text) · [🔗 Links](#-links)\n\n")
+              f.write("**Jump to:** [🏞️ High Quality Images](#-high-quality-images) · [🖼️ Thumbnails](#-thumbnails) · [📄 Text](#-text) · [🔗 Links](#-links)\n\n")
 
-              if download_images and downloaded_images:
-                  f.write("## 🖼️ Images\n\n")
-                  for img_file in downloaded_images:
-                      f.write(f"![{img_file}]({images_dir}/{img_file})\n\n")
-              elif download_images and not downloaded_images:
-                  f.write("## 🖼️ Images\n\n*No images found or downloaded.*\n\n")
+              # ----- New High Quality Images section -----
+              if high_quality_images:
+                  f.write("## 🏞️ High Quality Images\n\n")
+                  f.write("> These are the original high‑resolution images extracted directly from each pin URL found on the search page.\n\n")
+                  for pin_url, filename in high_quality_images:
+                      rel_path = os.path.join(images_dir, "high_quality", filename)
+                      f.write(f"<a href=\"{pin_url}\" target=\"_blank\"><img src=\"{rel_path}\" alt=\"Pin {filename}\" style=\"max-width:300px; margin:5px;\"></a>\n\n")
+                  f.write("\n")
               else:
-                  f.write("## 🖼️ Images\n\n*Image downloading was disabled for this run.*\n\n")
+                  f.write("## 🏞️ High Quality Images\n\n*No high‑quality images could be extracted from the pins on this page.*\n\n")
 
+              # ----- Existing Thumbnails section -----
+              if download_thumbnails and downloaded_thumbnails:
+                  f.write("## 🖼️ Thumbnails\n\n")
+                  for img_file in downloaded_thumbnails:
+                      f.write(f"![{img_file}]({images_dir}/{img_file})\n\n")
+              elif download_thumbnails and not downloaded_thumbnails:
+                  f.write("## 🖼️ Thumbnails\n\n*No thumbnails found or downloaded.*\n\n")
+              else:
+                  f.write("## 🖼️ Thumbnails\n\n*Thumbnail downloading was disabled for this run.*\n\n")
+
+              # ----- Text section -----
               f.write("## 📄 Text\n\n")
               f.write(f"<details{details_open}>\n<summary>{expand_summary} (full page text)</summary>\n\n")
               f.write("```\n")
@@ -372,6 +485,7 @@ jobs:
               f.write("\n```\n\n")
               f.write("</details>\n\n")
 
+              # ----- Links section -----
               f.write("## 🔗 Links\n\n")
               f.write(f"<details{details_open}>\n<summary>{expand_summary} (list of links)</summary>\n\n")
               for original, expanded in sorted(link_display_items, key=lambda x: x[0]):
@@ -382,9 +496,12 @@ jobs:
               f.write("\n</details>\n")
 
           print(f"Successfully wrote {output_filename}.")
-          if download_images:
-              print(f"Images downloaded to '{images_dir}/' folder and linked in README.")
+          if download_thumbnails:
+              print(f"Thumbnails saved to '{images_dir}/' folder.")
+          if high_quality_images:
+              print(f"High‑quality images saved to '{images_dir}/high_quality/' folder.")
 
+          # ------------------------- HISTORY SNAPSHOT ------------------------------------
           if store_history and page_load_success:
               folder_name = get_history_folder_name(target_url)
               history_path = os.path.join("History", folder_name)
