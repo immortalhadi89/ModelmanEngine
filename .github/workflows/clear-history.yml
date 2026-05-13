@@ -1,0 +1,31 @@
+name: '🧹 Clear History'
+
+on:
+  workflow_dispatch:
+    description: 'Delete only the History/ folder (preserves images/ and README.md)'
+
+jobs:
+  clear-history:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Delete History folder (if exists)
+        run: |
+          if [ -d "History" ]; then
+            rm -rf History
+            echo "Deleted History/ folder"
+          else
+            echo "History/ folder not found – nothing to delete"
+          fi
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Clear history: remove History/ folder [skip ci]"
+          git push
